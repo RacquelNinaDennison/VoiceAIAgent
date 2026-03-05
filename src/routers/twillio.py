@@ -12,6 +12,7 @@ from loguru import logger as log
 from core.agent import ConversationAgent
 from core.settings import settings
 from services.tts import synthesize_speech
+from services.webhook import post_call_data
 
 router = APIRouter(tags=["Twilio"])
 
@@ -28,6 +29,7 @@ DEEPGRAM_URL = (
 
 # Chunk size for streaming audio back to Twilio (~1s of mulaw at 8kHz)
 AUDIO_CHUNK_SIZE = 8192
+
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,7 @@ def incoming_call(request: Request) -> Response:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 async def _send_audio_to_twilio(
     websocket: WebSocket, stream_sid: str, audio_bytes: bytes
 ) -> None:
@@ -66,61 +69,6 @@ async def _send_audio_to_twilio(
         )
 
 
-async def _respond_to_customer(
-    transcript: str,
-    websocket: WebSocket,
-    stream_sid: str,
-    agent: ConversationAgent,
-) -> None:
-    """LLM → TTS → Twilio. Runs as an asyncio task per utterance."""
-    try:
-        log.info(f"[STT] {transcript}")
-        response_text, order_complete = await agent.respond(transcript)
-
-        if not response_text:
-            return
-
-        log.info(f"[LLM] {response_text}")
-
-        try:
-            audio = await synthesize_speech(response_text)
-            await _send_audio_to_twilio(websocket, stream_sid, audio)
-        except Exception as tts_exc:
-            log.error(f"[TTS] Failed: {tts_exc}")
-
-        if order_complete:
-            log.info(f"[ORDER]\n{agent.order.summary()}")
-
-    except Exception as exc:
-        log.error(f"Error during response: {exc}")
-
-
-async def _listen_to_deepgram(
-    deepgram_ws,
-    websocket: WebSocket,
-    stream_sid: str,
-    agent: ConversationAgent,
-) -> None:
-    """
-    Background task: reads Deepgram transcript messages and spawns a response
-    task for each final utterance.
-    """
-    async for raw in deepgram_ws:
-        data = json.loads(raw)
-
-        if not data.get("is_final"):
-            continue
-
-        try:
-            transcript: str = data["channel"]["alternatives"][0]["transcript"]
-        except (KeyError, IndexError):
-            continue
-
-        if transcript.strip():
-            asyncio.create_task(
-                _respond_to_customer(transcript, websocket, stream_sid, agent)
-            )
-
 
 # ---------------------------------------------------------------------------
 # Main WebSocket handler
@@ -132,10 +80,63 @@ async def media_stream(websocket: WebSocket) -> None:
     log.info("Call connected")
 
     deepgram_ws = None
-    deepgram_task = None
+    deepgram_task: asyncio.Task | None = None
     stream_sid: str | None = None
     agent = ConversationAgent()
 
+    # Tracks the currently active LLM→TTS→Twilio pipeline task so it can be
+    # cancelled on barge-in or when a new transcript supersedes it.
+    current_response_task: asyncio.Task | None = None
+
+    # ------------------------------------------------------------------
+    # Inner coroutine: pipeline one transcript through LLM → TTS → Twilio
+    # Sentences are synthesised and sent one at a time as the LLM streams,
+    # giving much lower perceived latency than waiting for the full reply.
+    # ------------------------------------------------------------------
+    async def run_response(transcript: str) -> None:
+        log.info(f"[STT] {transcript}")
+        try:
+            async for sentence in agent.respond_stream(transcript):
+                log.info(f"[LLM] {sentence}")
+                try:
+                    audio = await synthesize_speech(sentence)
+                    await _send_audio_to_twilio(websocket, stream_sid, audio)
+                except Exception as tts_exc:
+                    log.error(f"[TTS] Failed: {tts_exc}")
+        except Exception as exc:
+            log.error(f"Error during response: {exc}")
+        finally:
+            if agent.order.is_complete:
+                log.info(f"[ORDER]\n{agent.order.summary()}")
+
+    # ------------------------------------------------------------------
+    # Inner coroutine: read Deepgram transcripts and spawn response tasks
+    # ------------------------------------------------------------------
+    async def listen_to_deepgram(dg_ws) -> None:
+        nonlocal current_response_task
+        async for raw in dg_ws:
+            data = json.loads(raw)
+
+            if not data.get("is_final"):
+                continue
+
+            try:
+                transcript: str = data["channel"]["alternatives"][0]["transcript"]
+            except (KeyError, IndexError):
+                continue
+
+            if not transcript.strip():
+                continue
+
+            # Cancel any in-progress response before starting the new one
+            if current_response_task and not current_response_task.done():
+                current_response_task.cancel()
+
+            current_response_task = asyncio.create_task(run_response(transcript))
+
+    # ------------------------------------------------------------------
+    # Main event loop
+    # ------------------------------------------------------------------
     try:
         while True:
             message = await websocket.receive()
@@ -146,9 +147,9 @@ async def media_stream(websocket: WebSocket) -> None:
             data = json.loads(message["text"])
             event = data.get("event")
 
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             # START: Twilio has connected the audio stream
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             if event == "start":
                 stream_sid = data["start"]["streamSid"]
                 log.info(f"Stream started: {stream_sid}")
@@ -156,7 +157,6 @@ async def media_stream(websocket: WebSocket) -> None:
                 greeting = agent.get_greeting()
                 log.info(f"[GREETING] {greeting}")
 
-                # Kick off Deepgram connection and greeting TTS at the same time
                 ssl_ctx = ssl.create_default_context(cafile=certifi.where())
                 deepgram_ws, greeting_audio = await asyncio.gather(
                     websockets.connect(
@@ -170,7 +170,7 @@ async def media_stream(websocket: WebSocket) -> None:
                 )
 
                 deepgram_task = asyncio.create_task(
-                    _listen_to_deepgram(deepgram_ws, websocket, stream_sid, agent)
+                    listen_to_deepgram(deepgram_ws)
                 )
 
                 try:
@@ -178,16 +178,16 @@ async def media_stream(websocket: WebSocket) -> None:
                 except Exception as exc:
                     log.error(f"[TTS] Greeting failed: {exc}")
 
-            # ------------------------------------------------------------------
-            # MEDIA: forward raw audio bytes to Deepgram
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
+            # MEDIA: forward raw audio bytes to Deepgram; detect barge-in
+            # --------------------------------------------------------------
             elif event == "media" and deepgram_ws is not None:
                 audio_bytes = base64.b64decode(data["media"]["payload"])
                 await deepgram_ws.send(audio_bytes)
 
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             # STOP: caller hung up or Twilio ended the stream
-            # ------------------------------------------------------------------
+            # --------------------------------------------------------------
             elif event == "stop":
                 log.info("Stream stopped by Twilio")
                 break
@@ -196,10 +196,23 @@ async def media_stream(websocket: WebSocket) -> None:
         log.warning(f"WebSocket closed unexpectedly: {exc}")
 
     finally:
-        if deepgram_task is not None:
+        if current_response_task:
+            current_response_task.cancel()
+        if deepgram_task:
             deepgram_task.cancel()
-        if deepgram_ws is not None:
+        if deepgram_ws:
             await deepgram_ws.close()
+
         if agent.order.is_complete:
             log.info(f"FINAL ORDER:\n{agent.order.summary()}")
+
+        # Post call data to webhook if configured
+        if settings.webhook_url:
+            await post_call_data(
+                settings.webhook_url,
+                agent.history,
+                agent.order.summary() if agent.order.is_complete else None,
+                agent.order.total() if agent.order.is_complete else None,
+            )
+
         log.info("Call disconnected")

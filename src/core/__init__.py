@@ -1,6 +1,6 @@
 from .settings import Settings, settings
 from .agent import ConversationAgent
-from .restaurant import MENU, FAQ, Order, OrderItem, build_system_prompt
+from .restaurant import MENU, FAQ, Order, OrderItem, build_system_prompt, load_agent_config
 
 __all__ = [
     "Settings",
@@ -11,4 +11,5 @@ __all__ = [
     "Order",
     "OrderItem",
     "build_system_prompt",
+    "load_agent_config",
 ]
