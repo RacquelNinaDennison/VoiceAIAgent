@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from uvicorn import run
 from routers.twillio import router as twillio_router
+from routers.deepgram_twillio import router as deepgram_router
 from middleware import RequestLoggingMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from middleware.logging import setup_uvicorn_loggers
@@ -9,7 +10,8 @@ from loguru import logger as log
 app = FastAPI()
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(CORSMiddleware)
-app.include_router(twillio_router, prefix="/twillio")
+app.include_router(twillio_router, prefix="/twillio")   # Whisper STT pipeline
+app.include_router(deepgram_router, prefix="/deepgram") # Deepgram STT pipeline
 
 
 @app.get("/health")

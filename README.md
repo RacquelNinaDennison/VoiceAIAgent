@@ -157,9 +157,9 @@ HTTP method: `POST` (or `GET`).
 | Variable | Description |
 |----------|-------------|
 | `RIME_API_KEY` | Rime.ai API key for text-to-speech |
-| `OPENAI_AUTH` | OpenAI API key for gpt-4o-mini |
-| `DEEPGRAM_AUTH` | Deepgram API key for speech-to-text |
+| `OPENAI_AUTH` | OpenAI API key — used for Whisper STT and GPT-4o-mini |
 | `TWILLIO_AUTH` | Twilio auth token |
 | `TWILLIO_ACCOUNT_SID` | Twilio account SID |
+| `DEEPGRAM_AUTH` | Deepgram API key — used by the `/deepgram` pipeline |
 | `WEBHOOK_URL` | URL to POST call data to after each call (optional) |
 | `AGENT_CONFIG_PATH` | Path to a JSON agent config file (optional, see `agent_config.json`) |

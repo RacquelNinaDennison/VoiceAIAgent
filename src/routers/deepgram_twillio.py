@@ -1,7 +1,21 @@
+"""
+Twilio WebSocket handler — Deepgram streaming STT pipeline.
+
+STT: Deepgram Nova-2 (streaming, real-time endpointing)
+LLM: GPT-4o-mini (sentence-level streaming)
+TTS: Rime.ai
+
+Switch to this pipeline by pointing your Twilio webhook at:
+  POST /deepgram/incoming-call
+"""
+
 import asyncio
 import base64
 import json
+import ssl
 
+import certifi
+import websockets
 from fastapi import APIRouter, Request, Response
 from fastapi.websockets import WebSocket
 from loguru import logger as log
@@ -10,32 +24,21 @@ from core.agent import ConversationAgent
 from core.settings import settings
 from services.tts import synthesize_speech
 from services.webhook import post_call_data
-from services.whisper_stt import transcribe
 
-router = APIRouter(tags=["Twilio"])
+router = APIRouter(tags=["Twilio-Deepgram"])
+
+# Deepgram streaming STT — mulaw 8kHz matches Twilio's audio format exactly
+DEEPGRAM_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    "?model=nova-2"
+    "&encoding=mulaw"
+    "&sample_rate=8000"
+    "&channels=1"
+    "&punctuate=true"
+    "&endpointing=300"
+)
 
 AUDIO_CHUNK_SIZE = 8192
-
-# ---------------------------------------------------------------------------
-# Voice Activity Detection (VAD)
-# In mulaw encoding, silence is 0xFF. A frame is considered silent when
-# ≥95% of its bytes are 0xFF.
-# ---------------------------------------------------------------------------
-
-# Fraction of 0xFF bytes required to classify a frame as silence
-SILENCE_THRESHOLD = 0.95
-
-# Consecutive silent frames before we trigger transcription (~1.5s at 20ms/frame)
-SILENCE_FRAMES_TRIGGER = 75
-
-# Minimum speech frames required before we bother transcribing (~200ms)
-MIN_SPEECH_FRAMES = 10
-
-
-def _is_silence(frame: bytes) -> bool:
-    if not frame:
-        return True
-    return sum(1 for b in frame if b == 0xFF) / len(frame) >= SILENCE_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +51,7 @@ def incoming_call(request: Request) -> Response:
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://{host}/twillio/media-stream" />
+        <Stream url="wss://{host}/deepgram/media-stream" />
     </Connect>
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
@@ -79,26 +82,18 @@ async def _send_audio_to_twilio(
 @router.websocket("/media-stream")
 async def media_stream(websocket: WebSocket) -> None:
     await websocket.accept()
-    log.info("Call connected")
+    log.info("[DEEPGRAM] Call connected")
 
+    deepgram_ws = None
+    deepgram_task: asyncio.Task | None = None
     stream_sid: str | None = None
     agent = ConversationAgent()
     current_response_task: asyncio.Task | None = None
 
-    # VAD state
-    audio_buffer: bytearray = bytearray()
-    silence_frames = 0
-    speech_frames = 0
-
     # ------------------------------------------------------------------
-    # Inner: transcribe a buffered utterance and stream the response
+    # Inner: stream one transcript through LLM → TTS → Twilio
     # ------------------------------------------------------------------
-    async def run_response(mulaw_bytes: bytes) -> None:
-        transcript = await transcribe(mulaw_bytes)
-        if not transcript.strip():
-            log.debug("[STT] Empty transcript — skipping")
-            return
-
+    async def run_response(transcript: str) -> None:
         log.info(f"[STT] {transcript}")
         try:
             async for sentence in agent.respond_stream(transcript):
@@ -113,6 +108,30 @@ async def media_stream(websocket: WebSocket) -> None:
         finally:
             if agent.order.is_complete:
                 log.info(f"[ORDER]\n{agent.order.summary()}")
+
+    # ------------------------------------------------------------------
+    # Inner: read Deepgram final transcripts and spawn response tasks
+    # ------------------------------------------------------------------
+    async def listen_to_deepgram(dg_ws) -> None:
+        nonlocal current_response_task
+        async for raw in dg_ws:
+            data = json.loads(raw)
+
+            if not data.get("is_final"):
+                continue
+
+            try:
+                transcript: str = data["channel"]["alternatives"][0]["transcript"]
+            except (KeyError, IndexError):
+                continue
+
+            if not transcript.strip():
+                continue
+
+            if current_response_task and not current_response_task.done():
+                current_response_task.cancel()
+
+            current_response_task = asyncio.create_task(run_response(transcript))
 
     # ------------------------------------------------------------------
     # Main event loop
@@ -132,60 +151,54 @@ async def media_stream(websocket: WebSocket) -> None:
             # --------------------------------------------------------------
             if event == "start":
                 stream_sid = data["start"]["streamSid"]
-                log.info(f"Stream started: {stream_sid}")
+                log.info(f"[DEEPGRAM] Stream started: {stream_sid}")
 
                 greeting = agent.get_greeting()
-                log.info(f"[GREETING] {greeting}")
+                log.info(f"[DEEPGRAM] Greeting: {greeting}")
+
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                deepgram_ws, greeting_audio = await asyncio.gather(
+                    websockets.connect(
+                        DEEPGRAM_URL,
+                        additional_headers={
+                            "Authorization": f"Token {settings.deepgram_auth}"
+                        },
+                        ssl=ssl_ctx,
+                    ),
+                    synthesize_speech(greeting),
+                )
+
+                deepgram_task = asyncio.create_task(listen_to_deepgram(deepgram_ws))
+
                 try:
-                    greeting_audio = await synthesize_speech(greeting)
                     await _send_audio_to_twilio(websocket, stream_sid, greeting_audio)
                 except Exception as exc:
                     log.error(f"[TTS] Greeting failed: {exc}")
 
             # --------------------------------------------------------------
-            # MEDIA: VAD — buffer speech, trigger Whisper on sustained silence
+            # MEDIA: forward audio to Deepgram
             # --------------------------------------------------------------
-            elif event == "media":
-                frame = base64.b64decode(data["media"]["payload"])
-
-                if _is_silence(frame):
-                    silence_frames += 1
-
-                    # Enough silence after enough speech — trigger transcription
-                    if (
-                        silence_frames >= SILENCE_FRAMES_TRIGGER
-                        and speech_frames >= MIN_SPEECH_FRAMES
-                    ):
-                        utterance = bytes(audio_buffer)
-                        audio_buffer.clear()
-                        silence_frames = 0
-                        speech_frames = 0
-
-                        if current_response_task and not current_response_task.done():
-                            current_response_task.cancel()
-
-                        current_response_task = asyncio.create_task(
-                            run_response(utterance)
-                        )
-                else:
-                    # Non-silent frame — accumulate and reset silence counter
-                    silence_frames = 0
-                    speech_frames += 1
-                    audio_buffer.extend(frame)
+            elif event == "media" and deepgram_ws is not None:
+                audio_bytes = base64.b64decode(data["media"]["payload"])
+                await deepgram_ws.send(audio_bytes)
 
             # --------------------------------------------------------------
             # STOP
             # --------------------------------------------------------------
             elif event == "stop":
-                log.info("Stream stopped by Twilio")
+                log.info("[DEEPGRAM] Stream stopped by Twilio")
                 break
 
     except Exception as exc:
-        log.warning(f"WebSocket closed unexpectedly: {exc}")
+        log.warning(f"[DEEPGRAM] WebSocket closed unexpectedly: {exc}")
 
     finally:
         if current_response_task:
             current_response_task.cancel()
+        if deepgram_task:
+            deepgram_task.cancel()
+        if deepgram_ws:
+            await deepgram_ws.close()
         if agent.order.is_complete:
             log.info(f"FINAL ORDER:\n{agent.order.summary()}")
         if settings.webhook_url:
@@ -195,4 +208,4 @@ async def media_stream(websocket: WebSocket) -> None:
                 agent.order.summary() if agent.order.is_complete else None,
                 agent.order.total() if agent.order.is_complete else None,
             )
-        log.info("Call disconnected")
+        log.info("[DEEPGRAM] Call disconnected")
