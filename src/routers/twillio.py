@@ -6,9 +6,11 @@ from loguru import logger as log
 import asyncio
 import base64
 import json
+import ssl
+import certifi
 import websockets
 
-from core.Settings import settings
+from core.settings import settings
 
 router = APIRouter(tags=["Twillio"])
 
@@ -67,9 +69,11 @@ async def media_stream(websocket: WebSocket):
 
             if event == "start":
                 log.info("Twilio stream started — opening Deepgram connection")
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
                 deepgram_ws = await websockets.connect(
                     DEEPGRAM_URL,
-                    extra_headers={"Authorization": f"Token {settings.deepgram_auth}"},
+                    additional_headers={"Authorization": f"Token {settings.deepgram_auth}"},
+                    ssl=ssl_context,
                 )
                 deepgram_task = asyncio.create_task(listen_to_deepgram(deepgram_ws))
                 log.info("Deepgram connection open")
