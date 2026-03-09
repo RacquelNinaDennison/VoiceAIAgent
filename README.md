@@ -1,4 +1,4 @@
-# Rime — Voice AI Restaurant Agent
+#  Voice AI Restaurant Agent
 
 A real-time voice AI agent that handles inbound phone calls for a restaurant. Callers are greeted by **Aria**, an AI assistant that takes food and drink orders and answers common questions about the restaurant.
 
